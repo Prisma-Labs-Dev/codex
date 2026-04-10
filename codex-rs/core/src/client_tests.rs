@@ -1,4 +1,5 @@
 use super::AuthRequestTelemetryContext;
+use super::CopilotBillingInitiator;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::UnauthorizedRecoveryExecution;
@@ -6,6 +7,8 @@ use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
+use super::X_INITIATOR_HEADER;
+use super::X_INTERACTION_TYPE_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
 use codex_api::CoreAuthProvider;
 use codex_app_server_protocol::AuthMode;
@@ -20,6 +23,16 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
+    test_model_client_with_copilot_billing_headers(
+        session_source,
+        /*copilot_billing_headers*/ false,
+    )
+}
+
+fn test_model_client_with_copilot_billing_headers(
+    session_source: SessionSource,
+    copilot_billing_headers: bool,
+) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
     ModelClient::new(
         /*auth_manager*/ None,
@@ -31,7 +44,7 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*copilot_billing_headers*/ false,
+        copilot_billing_headers,
     )
 }
 
@@ -90,6 +103,53 @@ fn build_subagent_headers_sets_other_subagent_label() {
         .get(X_OPENAI_SUBAGENT_HEADER)
         .and_then(|value| value.to_str().ok());
     assert_eq!(value, Some("memory_consolidation"));
+}
+
+#[test]
+fn copilot_billing_user_initiator_is_not_consumed_until_marked_sent() {
+    let client = test_model_client_with_copilot_billing_headers(
+        SessionSource::Exec,
+        /*copilot_billing_headers*/ true,
+    );
+    let session = client.new_session();
+    session.begin_turn(/*user_initiated*/ true);
+
+    let first_attempt = session.next_copilot_billing_initiator();
+    let retry_attempt = session.next_copilot_billing_initiator();
+    assert_eq!(first_attempt, Some(CopilotBillingInitiator::User));
+    assert_eq!(retry_attempt, Some(CopilotBillingInitiator::User));
+
+    session.mark_copilot_billing_sent(first_attempt);
+    assert_eq!(
+        session.next_copilot_billing_initiator(),
+        Some(CopilotBillingInitiator::Agent)
+    );
+}
+
+#[test]
+fn copilot_billing_subagent_initiator_is_agent_even_when_turn_has_input() {
+    let client = test_model_client_with_copilot_billing_headers(
+        SessionSource::SubAgent(SubAgentSource::Review),
+        /*copilot_billing_headers*/ true,
+    );
+    let session = client.new_session();
+    session.begin_turn(/*user_initiated*/ true);
+
+    let initiator = session.next_copilot_billing_initiator();
+    let headers = session.copilot_billing_headers(initiator);
+    assert_eq!(initiator, Some(CopilotBillingInitiator::Agent));
+    assert_eq!(
+        headers
+            .get(X_INITIATOR_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("agent")
+    );
+    assert_eq!(
+        headers
+            .get(X_INTERACTION_TYPE_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("conversation-agent")
+    );
 }
 
 #[test]

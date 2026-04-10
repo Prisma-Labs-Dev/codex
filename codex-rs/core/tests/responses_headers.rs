@@ -1,6 +1,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
+use anyhow::Result;
 use codex_core::ModelClient;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
@@ -13,6 +14,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use core_test_support::load_default_config_for_test;
@@ -32,6 +35,201 @@ fn normalize_git_remote_url(url: &str) -> String {
 }
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+struct ResponsesHttpHarness {
+    _codex_home: TempDir,
+    client: ModelClient,
+    model_info: ModelInfo,
+    session_telemetry: SessionTelemetry,
+    effort: Option<ReasoningEffortConfig>,
+    summary: ReasoningSummary,
+}
+
+async fn responses_http_harness(
+    server: &wiremock::MockServer,
+    session_source: SessionSource,
+    copilot_billing_headers: bool,
+) -> Result<ResponsesHttpHarness> {
+    let provider = ModelProviderInfo {
+        name: "mock".into(),
+        base_url: Some(format!("{}/v1", server.uri())),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let codex_home = TempDir::new()?;
+    let mut config = load_default_config_for_test(&codex_home).await;
+    config.model_provider_id = provider.name.clone();
+    config.model_provider = provider.clone();
+    let effort = config.model_reasoning_effort;
+    let summary = config
+        .model_reasoning_summary
+        .unwrap_or(ReasoningSummary::Auto);
+    let model = codex_core::test_support::get_model_offline(config.model.as_deref());
+    config.model = Some(model.clone());
+    let config = Arc::new(config);
+
+    let conversation_id = ThreadId::new();
+    let model_info =
+        codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
+    let session_telemetry = SessionTelemetry::new(
+        conversation_id,
+        model.as_str(),
+        model_info.slug.as_str(),
+        /*account_id*/ None,
+        Some("test@test.com".to_string()),
+        Some(TelemetryAuthMode::Chatgpt),
+        "test_originator".to_string(),
+        /*log_user_prompts*/ false,
+        "test".to_string(),
+        session_source.clone(),
+    );
+
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        conversation_id,
+        /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
+        provider,
+        session_source,
+        config.model_verbosity,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        copilot_billing_headers,
+    );
+
+    Ok(ResponsesHttpHarness {
+        _codex_home: codex_home,
+        client,
+        model_info,
+        session_telemetry,
+        effort,
+        summary,
+    })
+}
+
+fn prompt_with_text(text: &str) -> Prompt {
+    let mut prompt = Prompt::default();
+    prompt.input = vec![ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText { text: text.into() }],
+        end_turn: None,
+        phase: None,
+    }];
+    prompt
+}
+
+async fn stream_once(
+    client_session: &mut codex_core::ModelClientSession,
+    harness: &ResponsesHttpHarness,
+    prompt: &Prompt,
+) -> Result<()> {
+    let mut stream = client_session
+        .stream(
+            prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort,
+            harness.summary,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
+        )
+        .await?;
+    while let Some(event) = stream.next().await {
+        if matches!(event?, ResponseEvent::Completed { .. }) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_copilot_billing_headers_mark_first_user_request_then_agent() -> Result<()>
+{
+    core_test_support::skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response_body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let request_log = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(response_body.clone()),
+            responses::sse_response(response_body),
+        ],
+    )
+    .await;
+
+    let harness = responses_http_harness(
+        &server,
+        SessionSource::Exec,
+        /*copilot_billing_headers*/ true,
+    )
+    .await?;
+    let mut client_session = harness.client.new_session();
+    client_session.begin_turn(/*user_initiated*/ true);
+    stream_once(&mut client_session, &harness, &prompt_with_text("hello")).await?;
+    stream_once(&mut client_session, &harness, &prompt_with_text("again")).await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].header("x-initiator").as_deref(), Some("user"));
+    assert_eq!(
+        requests[0].header("x-interaction-type").as_deref(),
+        Some("conversation-user")
+    );
+    assert_eq!(requests[1].header("x-initiator").as_deref(), Some("agent"));
+    assert_eq!(
+        requests[1].header("x-interaction-type").as_deref(),
+        Some("conversation-agent")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_copilot_billing_headers_mark_subagent_request_as_agent() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response_body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let request_log = responses::mount_sse_once(&server, response_body).await;
+
+    let harness = responses_http_harness(
+        &server,
+        SessionSource::SubAgent(SubAgentSource::Review),
+        /*copilot_billing_headers*/ true,
+    )
+    .await?;
+    let mut client_session = harness.client.new_session();
+    client_session.begin_turn(/*user_initiated*/ true);
+    stream_once(&mut client_session, &harness, &prompt_with_text("review")).await?;
+
+    let request = request_log.single_request();
+    assert_eq!(request.header("x-initiator").as_deref(), Some("agent"));
+    assert_eq!(
+        request.header("x-interaction-type").as_deref(),
+        Some("conversation-agent")
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn responses_stream_includes_subagent_header_on_review() {
