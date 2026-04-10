@@ -186,6 +186,10 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
+    /// Send X-Initiator / X-Interaction-Type headers so that only the first
+    /// API call per user-initiated turn is billed as a premium request when
+    /// using Copilot auth.
+    CopilotBillingHeaders,
 }
 
 impl Feature {
@@ -907,6 +911,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
         stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CopilotBillingHeaders,
+        key: "copilot_billing_headers",
+        stage: Stage::Stable,
         default_enabled: false,
     },
 ];

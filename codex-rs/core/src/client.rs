@@ -129,6 +129,8 @@ pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
 pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
+pub const X_INITIATOR_HEADER: &str = "X-Initiator";
+pub const X_INTERACTION_TYPE_HEADER: &str = "X-Interaction-Type";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
@@ -156,6 +158,7 @@ struct ModelClientState {
     beta_features_header: Option<String>,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    copilot_billing_headers: bool,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -222,6 +225,12 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    /// Whether the current turn is user-initiated (vs agent continuation).
+    /// Used for Copilot billing headers.
+    user_initiated_turn: AtomicBool,
+    /// Whether a user-initiated billing header has already been sent this turn.
+    /// Once true, subsequent requests in the same turn get `X-Initiator: agent`.
+    turn_billed: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +315,7 @@ impl ModelClient {
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
+        copilot_billing_headers: bool,
     ) -> Self {
         let auth_manager = auth_manager_for_provider(auth_manager, &provider);
         let codex_api_key_env_enabled = auth_manager
@@ -327,6 +337,7 @@ impl ModelClient {
                 beta_features_header,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                copilot_billing_headers,
             }),
         }
     }
@@ -340,6 +351,8 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
+            user_initiated_turn: AtomicBool::new(false),
+            turn_billed: AtomicBool::new(false),
         }
     }
 
@@ -808,6 +821,41 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    /// Marks the start of a new turn. When `user_initiated` is true, the first
+    /// API request in this turn will carry `X-Initiator: user` (billable);
+    /// subsequent requests will carry `X-Initiator: agent` (free).
+    pub fn begin_turn(&self, user_initiated: bool) {
+        self.user_initiated_turn
+            .store(user_initiated, Ordering::Relaxed);
+        self.turn_billed.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns Copilot billing headers if the feature is enabled.
+    /// The first call in a user-initiated turn returns `X-Initiator: user`;
+    /// all subsequent calls return `X-Initiator: agent`.
+    fn copilot_billing_headers(&self) -> ApiHeaderMap {
+        let mut headers = ApiHeaderMap::new();
+        if !self.client.state.copilot_billing_headers {
+            return headers;
+        }
+        let is_user = self.user_initiated_turn.load(Ordering::Relaxed)
+            && !self.turn_billed.swap(true, Ordering::Relaxed);
+        if is_user {
+            headers.insert(X_INITIATOR_HEADER, HeaderValue::from_static("user"));
+            headers.insert(
+                X_INTERACTION_TYPE_HEADER,
+                HeaderValue::from_static("conversation-user"),
+            );
+        } else {
+            headers.insert(X_INITIATOR_HEADER, HeaderValue::from_static("agent"));
+            headers.insert(
+                X_INTERACTION_TYPE_HEADER,
+                HeaderValue::from_static("conversation-agent"),
+            );
+        }
+        headers
+    }
+
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
@@ -910,6 +958,7 @@ impl ModelClientSession {
                     turn_metadata_header.as_ref(),
                 );
                 headers.extend(self.client.build_responses_identity_headers());
+                headers.extend(self.copilot_billing_headers());
                 headers
             },
             compression,
