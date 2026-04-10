@@ -373,12 +373,12 @@ impl FeedbackSnapshot {
         &self,
         classification: &str,
         reason: Option<&str>,
+        turn_id: Option<&str>,
         include_logs: bool,
         extra_attachment_paths: &[PathBuf],
         session_source: Option<SessionSource>,
         logs_override: Option<Vec<u8>>,
     ) -> Result<()> {
-        use std::collections::BTreeMap;
         use std::str::FromStr;
         use std::sync::Arc;
 
@@ -398,34 +398,7 @@ impl FeedbackSnapshot {
             ..Default::default()
         });
 
-        let cli_version = env!("CARGO_PKG_VERSION");
-        let mut tags = BTreeMap::from([
-            (String::from("thread_id"), self.thread_id.to_string()),
-            (String::from("classification"), classification.to_string()),
-            (String::from("cli_version"), cli_version.to_string()),
-        ]);
-        if let Some(source) = session_source.as_ref() {
-            tags.insert(String::from("session_source"), source.to_string());
-        }
-        if let Some(r) = reason {
-            tags.insert(String::from("reason"), r.to_string());
-        }
-
-        let reserved = [
-            "thread_id",
-            "classification",
-            "cli_version",
-            "session_source",
-            "reason",
-        ];
-        for (key, value) in &self.tags {
-            if reserved.contains(&key.as_str()) {
-                continue;
-            }
-            if let Entry::Vacant(entry) = tags.entry(key.clone()) {
-                entry.insert(value.clone());
-            }
-        }
+        let tags = self.upload_tags(classification, reason, turn_id, session_source.as_ref());
 
         let level = match classification {
             "bug" | "bad_result" | "safety_check" => Level::Error,
@@ -466,6 +439,49 @@ impl FeedbackSnapshot {
         client.send_envelope(envelope);
         client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS)));
         Ok(())
+    }
+
+    fn upload_tags(
+        &self,
+        classification: &str,
+        reason: Option<&str>,
+        turn_id: Option<&str>,
+        session_source: Option<&SessionSource>,
+    ) -> BTreeMap<String, String> {
+        let cli_version = env!("CARGO_PKG_VERSION");
+        let mut tags = BTreeMap::from([
+            (String::from("thread_id"), self.thread_id.to_string()),
+            (String::from("classification"), classification.to_string()),
+            (String::from("cli_version"), cli_version.to_string()),
+        ]);
+        if let Some(turn_id) = turn_id {
+            tags.insert(String::from("turn_id"), turn_id.to_string());
+        }
+        if let Some(source) = session_source {
+            tags.insert(String::from("session_source"), source.to_string());
+        }
+        if let Some(r) = reason {
+            tags.insert(String::from("reason"), r.to_string());
+        }
+
+        let reserved = [
+            "thread_id",
+            "turn_id",
+            "classification",
+            "cli_version",
+            "session_source",
+            "reason",
+        ];
+        for (key, value) in &self.tags {
+            if reserved.contains(&key.as_str()) {
+                continue;
+            }
+            if let Entry::Vacant(entry) = tags.entry(key.clone()) {
+                entry.insert(value.clone());
+            }
+        }
+
+        tags
     }
 
     fn feedback_attachments(
@@ -696,5 +712,55 @@ mod tests {
         );
         assert_eq!(attachments_without_diagnostics[0].buffer, vec![1]);
         fs::remove_file(extra_path).expect("extra attachment should be removed");
+    }
+
+    #[test]
+    fn upload_tags_include_turn_id_and_preserve_reserved_fields() {
+        let mut tags = BTreeMap::new();
+        tags.insert("thread_id".to_string(), "wrong-thread".to_string());
+        tags.insert("turn_id".to_string(), "wrong-turn".to_string());
+        tags.insert(
+            "classification".to_string(),
+            "wrong-classification".to_string(),
+        );
+        tags.insert("cli_version".to_string(), "wrong-version".to_string());
+        tags.insert("session_source".to_string(), "wrong-source".to_string());
+        tags.insert("reason".to_string(), "wrong-reason".to_string());
+        tags.insert("model".to_string(), "gpt-5".to_string());
+        let snapshot = FeedbackSnapshot {
+            bytes: Vec::new(),
+            tags,
+            feedback_diagnostics: FeedbackDiagnostics::default(),
+            thread_id: "thread-123".to_string(),
+        };
+
+        let upload_tags = snapshot.upload_tags(
+            "bug",
+            Some("actual reason"),
+            Some("turn-456"),
+            Some(&SessionSource::Cli),
+        );
+
+        assert_eq!(
+            upload_tags.get("thread_id").map(String::as_str),
+            Some("thread-123")
+        );
+        assert_eq!(
+            upload_tags.get("turn_id").map(String::as_str),
+            Some("turn-456")
+        );
+        assert_eq!(
+            upload_tags.get("classification").map(String::as_str),
+            Some("bug")
+        );
+        assert_eq!(
+            upload_tags.get("session_source").map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            upload_tags.get("reason").map(String::as_str),
+            Some("actual reason")
+        );
+        assert_eq!(upload_tags.get("model").map(String::as_str), Some("gpt-5"));
     }
 }
