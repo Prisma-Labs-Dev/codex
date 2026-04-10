@@ -48,6 +48,7 @@ use codex_config::types::ToolSuggestDiscoverable;
 use codex_config::types::TuiNotificationSettings;
 use codex_config::types::UriBasedFileOpener;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_features::CopilotBillingHeadersConfigToml;
 use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
@@ -524,6 +525,9 @@ pub struct Config {
     /// Settings for ghost snapshots (used for undo).
     pub ghost_snapshot: GhostSnapshotConfig,
 
+    /// Settings specific to Copilot billing header behavior.
+    pub copilot_billing: CopilotBillingConfig,
+
     /// Settings specific to the task-path-based multi-agent tool surface.
     pub multi_agent_v2: MultiAgentV2Config,
 
@@ -576,6 +580,11 @@ pub struct MultiAgentV2Config {
     pub usage_hint_enabled: bool,
     pub usage_hint_text: Option<String>,
     pub hide_spawn_agent_metadata: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopilotBillingConfig {
+    pub chain_tasks: bool,
 }
 
 impl Default for MultiAgentV2Config {
@@ -1339,6 +1348,31 @@ fn multi_agent_v2_toml_config(features: Option<&FeaturesToml>) -> Option<&MultiA
     }
 }
 
+fn resolve_copilot_billing_config(
+    config_toml: &ConfigToml,
+    config_profile: &ConfigProfile,
+) -> CopilotBillingConfig {
+    let base = copilot_billing_toml_config(config_toml.features.as_ref());
+    let profile = copilot_billing_toml_config(config_profile.features.as_ref());
+    let default = CopilotBillingConfig::default();
+
+    let chain_tasks = profile
+        .and_then(|config| config.chain_tasks)
+        .or_else(|| base.and_then(|config| config.chain_tasks))
+        .unwrap_or(default.chain_tasks);
+
+    CopilotBillingConfig { chain_tasks }
+}
+
+fn copilot_billing_toml_config(
+    features: Option<&FeaturesToml>,
+) -> Option<&CopilotBillingHeadersConfigToml> {
+    match features?.copilot_billing_headers.as_ref()? {
+        FeatureToml::Enabled(_) => None,
+        FeatureToml::Config(config) => Some(config),
+    }
+}
+
 pub(crate) fn resolve_web_search_mode_for_turn(
     web_search_mode: &Constrained<WebSearchMode>,
     sandbox_policy: &SandboxPolicy,
@@ -1670,6 +1704,7 @@ impl Config {
         let web_search_mode = resolve_web_search_mode(&cfg, &config_profile, &features)
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
+        let copilot_billing = resolve_copilot_billing_config(&cfg, &config_profile);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg, &config_profile);
 
         let agent_roles =
@@ -2109,6 +2144,7 @@ impl Config {
             use_experimental_unified_exec_tool,
             background_terminal_max_timeout,
             ghost_snapshot,
+            copilot_billing,
             multi_agent_v2,
             features,
             suppress_unstable_features_warning: cfg

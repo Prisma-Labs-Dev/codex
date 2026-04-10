@@ -362,6 +362,9 @@
             "connectors": {
               "type": "boolean"
             },
+            "copilot_billing_headers": {
+              "$ref": "#/definitions/FeatureToml_for_CopilotBillingHeadersConfigToml"
+            },
             "default_mode_request_user_input": {
               "type": "boolean"
             },
@@ -617,6 +620,28 @@
         }
       },
       "type": "object"
+    },
+    "CopilotBillingHeadersConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "chain_tasks": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "FeatureToml_for_CopilotBillingHeadersConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/CopilotBillingHeadersConfigToml"
+        }
+      ]
     },
     "FeatureToml_for_MultiAgentV2ConfigToml": {
       "anyOf": [
@@ -2163,6 +2188,9 @@
         },
         "connectors": {
           "type": "boolean"
+        },
+        "copilot_billing_headers": {
+          "$ref": "#/definitions/FeatureToml_for_CopilotBillingHeadersConfigToml"
         },
         "default_mode_request_user_input": {
           "type": "boolean"

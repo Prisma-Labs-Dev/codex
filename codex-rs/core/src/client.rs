@@ -159,6 +159,8 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
     copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
+    copilot_billing_chain_billed: AtomicBool,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -230,6 +232,8 @@ pub struct ModelClientSession {
     user_initiated_turn: AtomicBool,
     /// Whether a user-initiated billing header has already been sent this turn.
     /// Once true, subsequent requests in the same turn get `X-Initiator: agent`.
+    /// When task chaining is enabled, the session-scoped state on [`ModelClientState`] is used
+    /// instead so later user turns in the same Codex session are also treated as agent-initiated.
     turn_billed: AtomicBool,
 }
 
@@ -346,6 +350,7 @@ impl ModelClient {
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
         copilot_billing_headers: bool,
+        copilot_billing_chain_tasks: bool,
     ) -> Self {
         let auth_manager = auth_manager_for_provider(auth_manager, &provider);
         let codex_api_key_env_enabled = auth_manager
@@ -368,6 +373,8 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 copilot_billing_headers,
+                copilot_billing_chain_tasks,
+                copilot_billing_chain_billed: AtomicBool::new(false),
             }),
         }
     }
@@ -866,7 +873,9 @@ impl ModelClientSession {
     pub fn begin_turn(&self, user_initiated: bool) {
         self.user_initiated_turn
             .store(user_initiated, Ordering::Relaxed);
-        self.turn_billed.store(false, Ordering::Relaxed);
+        if !self.client.state.copilot_billing_chain_tasks {
+            self.turn_billed.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Returns the Copilot billing initiator for the next request attempt.
@@ -880,8 +889,16 @@ impl ModelClientSession {
         if matches!(self.client.state.session_source, SessionSource::SubAgent(_)) {
             return Some(CopilotBillingInitiator::Agent);
         }
-        let is_user = self.user_initiated_turn.load(Ordering::Relaxed)
-            && !self.turn_billed.load(Ordering::Relaxed);
+        let user_initiated = self.user_initiated_turn.load(Ordering::Relaxed);
+        let already_billed = if self.client.state.copilot_billing_chain_tasks {
+            self.client
+                .state
+                .copilot_billing_chain_billed
+                .load(Ordering::Relaxed)
+        } else {
+            self.turn_billed.load(Ordering::Relaxed)
+        };
+        let is_user = user_initiated && !already_billed;
         if is_user {
             Some(CopilotBillingInitiator::User)
         } else {
@@ -891,7 +908,14 @@ impl ModelClientSession {
 
     fn mark_copilot_billing_sent(&self, initiator: Option<CopilotBillingInitiator>) {
         if initiator == Some(CopilotBillingInitiator::User) {
-            self.turn_billed.store(true, Ordering::Relaxed);
+            if self.client.state.copilot_billing_chain_tasks {
+                self.client
+                    .state
+                    .copilot_billing_chain_billed
+                    .store(true, Ordering::Relaxed);
+            } else {
+                self.turn_billed.store(true, Ordering::Relaxed);
+            }
         }
     }
 

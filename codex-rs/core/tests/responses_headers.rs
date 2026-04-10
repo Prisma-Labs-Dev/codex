@@ -49,6 +49,7 @@ async fn responses_http_harness(
     server: &wiremock::MockServer,
     session_source: SessionSource,
     copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
 ) -> Result<ResponsesHttpHarness> {
     let provider = ModelProviderInfo {
         name: "mock".into(),
@@ -108,6 +109,7 @@ async fn responses_http_harness(
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         copilot_billing_headers,
+        copilot_billing_chain_tasks,
     );
 
     Ok(ResponsesHttpHarness {
@@ -179,6 +181,7 @@ async fn responses_stream_copilot_billing_headers_mark_first_user_request_then_a
         &server,
         SessionSource::Exec,
         /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
     )
     .await?;
     let mut client_session = harness.client.new_session();
@@ -216,6 +219,7 @@ async fn responses_stream_copilot_billing_headers_mark_subagent_request_as_agent
         &server,
         SessionSource::SubAgent(SubAgentSource::Review),
         /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
     )
     .await?;
     let mut client_session = harness.client.new_session();
@@ -228,6 +232,56 @@ async fn responses_stream_copilot_billing_headers_mark_subagent_request_as_agent
         request.header("x-interaction-type").as_deref(),
         Some("conversation-agent")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_stream_copilot_billing_chain_tasks_marks_next_user_turn_agent() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response_body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let request_log = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(response_body.clone()),
+            responses::sse_response(response_body),
+        ],
+    )
+    .await;
+
+    let harness = responses_http_harness(
+        &server,
+        SessionSource::Exec,
+        /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ true,
+    )
+    .await?;
+
+    let mut first_session = harness.client.new_session();
+    first_session.begin_turn(/*user_initiated*/ true);
+    stream_once(&mut first_session, &harness, &prompt_with_text("hello")).await?;
+
+    let mut chained_session = harness.client.new_session();
+    chained_session.begin_turn(/*user_initiated*/ true);
+    stream_once(&mut chained_session, &harness, &prompt_with_text("again")).await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].header("x-initiator").as_deref(), Some("user"));
+    assert_eq!(
+        requests[0].header("x-interaction-type").as_deref(),
+        Some("conversation-user")
+    );
+    assert_eq!(requests[1].header("x-initiator").as_deref(), Some("agent"));
+    assert_eq!(
+        requests[1].header("x-interaction-type").as_deref(),
+        Some("conversation-agent")
+    );
+
     Ok(())
 }
 
@@ -306,6 +360,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*copilot_billing_headers*/ false,
+        /*copilot_billing_chain_tasks*/ false,
     );
     let mut client_session = client.new_session();
 
@@ -432,6 +487,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*copilot_billing_headers*/ false,
+        /*copilot_billing_chain_tasks*/ false,
     );
     let mut client_session = client.new_session();
 
@@ -547,6 +603,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*copilot_billing_headers*/ false,
+        /*copilot_billing_chain_tasks*/ false,
     );
     let mut client_session = client.new_session();
 

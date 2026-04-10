@@ -171,6 +171,7 @@ async fn responses_websocket_copilot_billing_headers_reconnect_for_agent_continu
         &server,
         /*runtime_metrics_enabled*/ false,
         /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
         SessionSource::Exec,
     )
     .await;
@@ -223,6 +224,7 @@ async fn responses_websocket_copilot_billing_headers_mark_subagent_as_agent() {
         &server,
         /*runtime_metrics_enabled*/ false,
         /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
         SessionSource::SubAgent(SubAgentSource::Review),
     )
     .await;
@@ -1858,6 +1860,7 @@ async fn websocket_harness_with_options(
         server,
         runtime_metrics_enabled,
         /*copilot_billing_headers*/ false,
+        /*copilot_billing_chain_tasks*/ false,
         SessionSource::Exec,
     )
     .await
@@ -1867,12 +1870,14 @@ async fn websocket_harness_with_options_and_billing(
     server: &WebSocketTestServer,
     runtime_metrics_enabled: bool,
     copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
     session_source: SessionSource,
 ) -> WebsocketTestHarness {
     websocket_harness_with_provider_options(
         websocket_provider(server),
         runtime_metrics_enabled,
         copilot_billing_headers,
+        copilot_billing_chain_tasks,
         session_source,
     )
     .await
@@ -1882,6 +1887,7 @@ async fn websocket_harness_with_provider_options(
     provider: ModelProviderInfo,
     runtime_metrics_enabled: bool,
     copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
     session_source: SessionSource,
 ) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
@@ -1930,6 +1936,7 @@ async fn websocket_harness_with_provider_options(
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
         copilot_billing_headers,
+        copilot_billing_chain_tasks,
     );
 
     WebsocketTestHarness {

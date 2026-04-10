@@ -26,12 +26,14 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_copilot_billing_headers(
         session_source,
         /*copilot_billing_headers*/ false,
+        /*copilot_billing_chain_tasks*/ false,
     )
 }
 
 fn test_model_client_with_copilot_billing_headers(
     session_source: SessionSource,
     copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
 ) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
     ModelClient::new(
@@ -45,6 +47,7 @@ fn test_model_client_with_copilot_billing_headers(
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         copilot_billing_headers,
+        copilot_billing_chain_tasks,
     )
 }
 
@@ -110,6 +113,7 @@ fn copilot_billing_user_initiator_is_not_consumed_until_marked_sent() {
     let client = test_model_client_with_copilot_billing_headers(
         SessionSource::Exec,
         /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
     );
     let session = client.new_session();
     session.begin_turn(/*user_initiated*/ true);
@@ -124,6 +128,35 @@ fn copilot_billing_user_initiator_is_not_consumed_until_marked_sent() {
         session.next_copilot_billing_initiator(),
         Some(CopilotBillingInitiator::Agent)
     );
+
+    let next_turn_session = client.new_session();
+    next_turn_session.begin_turn(/*user_initiated*/ true);
+    assert_eq!(
+        next_turn_session.next_copilot_billing_initiator(),
+        Some(CopilotBillingInitiator::User)
+    );
+}
+
+#[test]
+fn copilot_billing_chain_tasks_shares_user_marker_across_sessions() {
+    let client = test_model_client_with_copilot_billing_headers(
+        SessionSource::Exec,
+        /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ true,
+    );
+    let first_session = client.new_session();
+    first_session.begin_turn(/*user_initiated*/ true);
+    let first_attempt = first_session.next_copilot_billing_initiator();
+    assert_eq!(first_attempt, Some(CopilotBillingInitiator::User));
+
+    first_session.mark_copilot_billing_sent(first_attempt);
+
+    let chained_session = client.new_session();
+    chained_session.begin_turn(/*user_initiated*/ true);
+    assert_eq!(
+        chained_session.next_copilot_billing_initiator(),
+        Some(CopilotBillingInitiator::Agent)
+    );
 }
 
 #[test]
@@ -131,6 +164,7 @@ fn copilot_billing_subagent_initiator_is_agent_even_when_turn_has_input() {
     let client = test_model_client_with_copilot_billing_headers(
         SessionSource::SubAgent(SubAgentSource::Review),
         /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
     );
     let session = client.new_session();
     session.begin_turn(/*user_initiated*/ true);
