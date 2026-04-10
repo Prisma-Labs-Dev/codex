@@ -129,6 +129,8 @@ pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
 pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
+pub const X_INITIATOR_HEADER: &str = "X-Initiator";
+pub const X_INTERACTION_TYPE_HEADER: &str = "X-Interaction-Type";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const RESPONSES_ENDPOINT: &str = "/responses";
 const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
@@ -156,6 +158,9 @@ struct ModelClientState {
     beta_features_header: Option<String>,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
+    copilot_billing_chain_billed: AtomicBool,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -222,6 +227,43 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    /// Whether the current turn is user-initiated (vs agent continuation).
+    /// Used for Copilot billing headers.
+    user_initiated_turn: AtomicBool,
+    /// Whether a user-initiated billing header has already been sent this turn.
+    /// Once true, subsequent requests in the same turn get `X-Initiator: agent`.
+    /// When task chaining is enabled, the session-scoped state on [`ModelClientState`] is used
+    /// instead so later user turns in the same Codex session are also treated as agent-initiated.
+    turn_billed: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopilotBillingInitiator {
+    User,
+    Agent,
+}
+
+impl CopilotBillingInitiator {
+    fn headers(self) -> ApiHeaderMap {
+        let mut headers = ApiHeaderMap::new();
+        match self {
+            Self::User => {
+                headers.insert(X_INITIATOR_HEADER, HeaderValue::from_static("user"));
+                headers.insert(
+                    X_INTERACTION_TYPE_HEADER,
+                    HeaderValue::from_static("conversation-user"),
+                );
+            }
+            Self::Agent => {
+                headers.insert(X_INITIATOR_HEADER, HeaderValue::from_static("agent"));
+                headers.insert(
+                    X_INTERACTION_TYPE_HEADER,
+                    HeaderValue::from_static("conversation-agent"),
+                );
+            }
+        }
+        headers
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +275,7 @@ struct LastResponse {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    copilot_billing_initiator: Option<CopilotBillingInitiator>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     connection_reused: StdMutex<bool>,
@@ -306,6 +349,8 @@ impl ModelClient {
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
+        copilot_billing_headers: bool,
+        copilot_billing_chain_tasks: bool,
     ) -> Self {
         let auth_manager = auth_manager_for_provider(auth_manager, &provider);
         let codex_api_key_env_enabled = auth_manager
@@ -327,6 +372,9 @@ impl ModelClient {
                 beta_features_header,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                copilot_billing_headers,
+                copilot_billing_chain_tasks,
+                copilot_billing_chain_billed: AtomicBool::new(false),
             }),
         }
     }
@@ -340,6 +388,8 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
+            user_initiated_turn: AtomicBool::new(false),
+            turn_billed: AtomicBool::new(false),
         }
     }
 
@@ -688,10 +738,15 @@ impl ModelClient {
         api_auth: CoreAuthProvider,
         turn_state: Option<Arc<OnceLock<String>>>,
         turn_metadata_header: Option<&str>,
+        copilot_billing_initiator: Option<CopilotBillingInitiator>,
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
     ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
-        let headers = self.build_websocket_headers(turn_state.as_ref(), turn_metadata_header);
+        let headers = self.build_websocket_headers(
+            turn_state.as_ref(),
+            turn_metadata_header,
+            copilot_billing_initiator,
+        );
         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
             session_telemetry,
             auth_context,
@@ -772,6 +827,7 @@ impl ModelClient {
         &self,
         turn_state: Option<&Arc<OnceLock<String>>>,
         turn_metadata_header: Option<&str>,
+        copilot_billing_initiator: Option<CopilotBillingInitiator>,
     ) -> ApiHeaderMap {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
         let conversation_id = self.state.conversation_id.to_string();
@@ -795,6 +851,9 @@ impl ModelClient {
                 HeaderValue::from_static("true"),
             );
         }
+        if let Some(initiator) = copilot_billing_initiator {
+            headers.extend(initiator.headers());
+        }
         headers
     }
 }
@@ -808,8 +867,67 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    /// Marks the start of a new turn. When `user_initiated` is true, the first
+    /// API request in this turn will carry `X-Initiator: user` (billable);
+    /// subsequent requests will carry `X-Initiator: agent` (free).
+    pub fn begin_turn(&self, user_initiated: bool) {
+        self.user_initiated_turn
+            .store(user_initiated, Ordering::Relaxed);
+        if !self.client.state.copilot_billing_chain_tasks {
+            self.turn_billed.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the Copilot billing initiator for the next request attempt.
+    ///
+    /// This does not mutate billing state. Call [`Self::mark_copilot_billing_sent`] only after the
+    /// selected request attempt is successfully accepted by the transport.
+    fn next_copilot_billing_initiator(&self) -> Option<CopilotBillingInitiator> {
+        if !self.client.state.copilot_billing_headers {
+            return None;
+        }
+        if matches!(self.client.state.session_source, SessionSource::SubAgent(_)) {
+            return Some(CopilotBillingInitiator::Agent);
+        }
+        let user_initiated = self.user_initiated_turn.load(Ordering::Relaxed);
+        let already_billed = if self.client.state.copilot_billing_chain_tasks {
+            self.client
+                .state
+                .copilot_billing_chain_billed
+                .load(Ordering::Relaxed)
+        } else {
+            self.turn_billed.load(Ordering::Relaxed)
+        };
+        let is_user = user_initiated && !already_billed;
+        if is_user {
+            Some(CopilotBillingInitiator::User)
+        } else {
+            Some(CopilotBillingInitiator::Agent)
+        }
+    }
+
+    fn mark_copilot_billing_sent(&self, initiator: Option<CopilotBillingInitiator>) {
+        if initiator == Some(CopilotBillingInitiator::User) {
+            if self.client.state.copilot_billing_chain_tasks {
+                self.client
+                    .state
+                    .copilot_billing_chain_billed
+                    .store(true, Ordering::Relaxed);
+            } else {
+                self.turn_billed.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn copilot_billing_headers(&self, initiator: Option<CopilotBillingInitiator>) -> ApiHeaderMap {
+        initiator
+            .map(CopilotBillingInitiator::headers)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.copilot_billing_initiator = None;
         self.websocket_session.last_request = None;
         self.websocket_session.last_response_rx = None;
         self.websocket_session
@@ -897,6 +1015,7 @@ impl ModelClientSession {
         &self,
         turn_metadata_header: Option<&str>,
         compression: Compression,
+        copilot_billing_initiator: Option<CopilotBillingInitiator>,
     ) -> ApiResponsesOptions {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
         let conversation_id = self.client.state.conversation_id.to_string();
@@ -910,6 +1029,7 @@ impl ModelClientSession {
                     turn_metadata_header.as_ref(),
                 );
                 headers.extend(self.client.build_responses_identity_headers());
+                headers.extend(self.copilot_billing_headers(copilot_billing_initiator));
                 headers
             },
             compression,
@@ -1027,11 +1147,13 @@ impl ModelClientSession {
                 client_setup.api_auth,
                 Some(Arc::clone(&self.turn_state)),
                 /*turn_metadata_header*/ None,
+                /*copilot_billing_initiator*/ None,
                 auth_context,
                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
             )
             .await?;
         self.websocket_session.connection = Some(connection);
+        self.websocket_session.copilot_billing_initiator = None;
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
         Ok(())
@@ -1059,9 +1181,15 @@ impl ModelClientSession {
             api_auth,
             turn_metadata_header,
             options,
+            copilot_billing_initiator,
             auth_context,
             request_route_telemetry,
         } = params;
+        if self.websocket_session.connection.is_some()
+            && self.websocket_session.copilot_billing_initiator != copilot_billing_initiator
+        {
+            self.reset_websocket_session();
+        }
         let needs_new = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
             None => true,
@@ -1082,6 +1210,7 @@ impl ModelClientSession {
                     api_auth,
                     Some(turn_state),
                     turn_metadata_header,
+                    copilot_billing_initiator,
                     auth_context,
                     request_route_telemetry,
                 )
@@ -1096,6 +1225,7 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.copilot_billing_initiator = copilot_billing_initiator;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {
@@ -1181,7 +1311,12 @@ impl ModelClientSession {
                 self.client.state.auth_env_telemetry.clone(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
-            let options = self.build_responses_options(turn_metadata_header, compression);
+            let copilot_billing_initiator = self.next_copilot_billing_initiator();
+            let options = self.build_responses_options(
+                turn_metadata_header,
+                compression,
+                copilot_billing_initiator,
+            );
 
             let request = self.build_responses_request(
                 &client_setup.api_provider,
@@ -1201,6 +1336,7 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
+                    self.mark_copilot_billing_sent(copilot_billing_initiator);
                     let (stream, _) = map_response_stream(stream, session_telemetry.clone());
                     return Ok(stream);
                 }
@@ -1264,7 +1400,12 @@ impl ModelClientSession {
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
 
-            let options = self.build_responses_options(turn_metadata_header, compression);
+            let copilot_billing_initiator = self.next_copilot_billing_initiator();
+            let options = self.build_responses_options(
+                turn_metadata_header,
+                compression,
+                copilot_billing_initiator,
+            );
             let request = self.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
@@ -1291,6 +1432,7 @@ impl ModelClientSession {
                     api_auth: client_setup.api_auth,
                     turn_metadata_header,
                     options: &options,
+                    copilot_billing_initiator,
                     auth_context: request_auth_context,
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
                         RESPONSES_ENDPOINT,
@@ -1331,6 +1473,7 @@ impl ModelClientSession {
                 .stream_request(ws_request, self.websocket_session.connection_reused())
                 .await
                 .map_err(map_api_error)?;
+            self.mark_copilot_billing_sent(copilot_billing_initiator);
             let (stream, last_request_rx) =
                 map_response_stream(stream_result, session_telemetry.clone());
             self.websocket_session.last_response_rx = Some(last_request_rx);
@@ -1712,6 +1855,7 @@ struct WebsocketConnectParams<'a> {
     api_auth: CoreAuthProvider,
     turn_metadata_header: Option<&'a str>,
     options: &'a ApiResponsesOptions,
+    copilot_billing_initiator: Option<CopilotBillingInitiator>,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
 }

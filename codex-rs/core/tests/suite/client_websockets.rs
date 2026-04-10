@@ -27,6 +27,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
@@ -152,6 +153,93 @@ async fn responses_websocket_streams_without_feature_flag_when_provider_supports
 
     assert_eq!(server.handshakes().len(), 1);
     assert_eq!(server.single_connection().len(), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_copilot_billing_headers_reconnect_for_agent_continuation() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![
+        vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+
+    let harness = websocket_harness_with_options_and_billing(
+        &server,
+        /*runtime_metrics_enabled*/ false,
+        /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
+        SessionSource::Exec,
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    client_session.begin_turn(/*user_initiated*/ true);
+
+    stream_until_complete(
+        &mut client_session,
+        &harness,
+        &prompt_with_input(vec![message_item("hello")]),
+    )
+    .await;
+    stream_until_complete(
+        &mut client_session,
+        &harness,
+        &prompt_with_input(vec![message_item("again")]),
+    )
+    .await;
+
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), 2);
+    assert_eq!(handshakes[0].header("x-initiator").as_deref(), Some("user"));
+    assert_eq!(
+        handshakes[0].header("x-interaction-type").as_deref(),
+        Some("conversation-user")
+    );
+    assert_eq!(
+        handshakes[1].header("x-initiator").as_deref(),
+        Some("agent")
+    );
+    assert_eq!(
+        handshakes[1].header("x-interaction-type").as_deref(),
+        Some("conversation-agent")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_copilot_billing_headers_mark_subagent_as_agent() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness_with_options_and_billing(
+        &server,
+        /*runtime_metrics_enabled*/ false,
+        /*copilot_billing_headers*/ true,
+        /*copilot_billing_chain_tasks*/ false,
+        SessionSource::SubAgent(SubAgentSource::Review),
+    )
+    .await;
+    let mut client_session = harness.client.new_session();
+    client_session.begin_turn(/*user_initiated*/ true);
+    let prompt = prompt_with_input(vec![message_item("review")]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt).await;
+
+    let handshake = server.single_handshake();
+    assert_eq!(handshake.header("x-initiator").as_deref(), Some("agent"));
+    assert_eq!(
+        handshake.header("x-interaction-type").as_deref(),
+        Some("conversation-agent")
+    );
 
     server.shutdown().await;
 }
@@ -1768,13 +1856,39 @@ async fn websocket_harness_with_options(
     server: &WebSocketTestServer,
     runtime_metrics_enabled: bool,
 ) -> WebsocketTestHarness {
-    websocket_harness_with_provider_options(websocket_provider(server), runtime_metrics_enabled)
-        .await
+    websocket_harness_with_options_and_billing(
+        server,
+        runtime_metrics_enabled,
+        /*copilot_billing_headers*/ false,
+        /*copilot_billing_chain_tasks*/ false,
+        SessionSource::Exec,
+    )
+    .await
+}
+
+async fn websocket_harness_with_options_and_billing(
+    server: &WebSocketTestServer,
+    runtime_metrics_enabled: bool,
+    copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
+    session_source: SessionSource,
+) -> WebsocketTestHarness {
+    websocket_harness_with_provider_options(
+        websocket_provider(server),
+        runtime_metrics_enabled,
+        copilot_billing_headers,
+        copilot_billing_chain_tasks,
+        session_source,
+    )
+    .await
 }
 
 async fn websocket_harness_with_provider_options(
     provider: ModelProviderInfo,
     runtime_metrics_enabled: bool,
+    copilot_billing_headers: bool,
+    copilot_billing_chain_tasks: bool,
+    session_source: SessionSource,
 ) -> WebsocketTestHarness {
     let codex_home = TempDir::new().unwrap();
     let mut config = load_default_config_for_test(&codex_home).await;
@@ -1806,7 +1920,7 @@ async fn websocket_harness_with_provider_options(
         "test_originator".to_string(),
         /*log_user_prompts*/ false,
         "test".to_string(),
-        SessionSource::Exec,
+        session_source.clone(),
     )
     .with_metrics(metrics);
     let effort = None;
@@ -1816,11 +1930,13 @@ async fn websocket_harness_with_provider_options(
         conversation_id,
         /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),
-        SessionSource::Exec,
+        session_source,
         config.model_verbosity,
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,
+        copilot_billing_headers,
+        copilot_billing_chain_tasks,
     );
 
     WebsocketTestHarness {

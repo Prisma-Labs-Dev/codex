@@ -16,6 +16,7 @@ use toml::Table;
 
 mod feature_configs;
 mod legacy;
+pub use feature_configs::CopilotBillingHeadersConfigToml;
 pub use feature_configs::MultiAgentV2ConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
@@ -186,6 +187,10 @@ pub enum Feature {
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
     ResponsesWebsocketsV2,
+    /// Send X-Initiator / X-Interaction-Type headers so that only the first
+    /// API call per user-initiated turn is billed as a premium request when
+    /// using Copilot auth.
+    CopilotBillingHeaders,
 }
 
 impl Feature {
@@ -494,6 +499,8 @@ pub fn is_known_feature_key(key: &str) -> bool {
 pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copilot_billing_headers: Option<FeatureToml<CopilotBillingHeadersConfigToml>>,
     /// Boolean feature toggles keyed by canonical or legacy feature name.
     #[serde(flatten)]
     entries: BTreeMap<String, bool>,
@@ -511,6 +518,13 @@ impl FeaturesToml {
         let mut entries = self.entries.clone();
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self
+            .copilot_billing_headers
+            .as_ref()
+            .and_then(FeatureToml::enabled)
+        {
+            entries.insert(Feature::CopilotBillingHeaders.key().to_string(), enabled);
         }
         entries
     }
@@ -907,6 +921,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ResponsesWebsocketsV2,
         key: "responses_websockets_v2",
         stage: Stage::Removed,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CopilotBillingHeaders,
+        key: "copilot_billing_headers",
+        stage: Stage::Stable,
         default_enabled: false,
     },
 ];

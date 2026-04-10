@@ -4573,6 +4573,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             use_experimental_unified_exec_tool: !cfg!(windows),
             background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ghost_snapshot: GhostSnapshotConfig::default(),
+            copilot_billing: CopilotBillingConfig::default(),
             multi_agent_v2: MultiAgentV2Config::default(),
             features: Features::with_defaults().into(),
             suppress_unstable_features_warning: false,
@@ -4719,6 +4720,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         use_experimental_unified_exec_tool: !cfg!(windows),
         background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
         ghost_snapshot: GhostSnapshotConfig::default(),
+        copilot_billing: CopilotBillingConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
@@ -4863,6 +4865,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         use_experimental_unified_exec_tool: !cfg!(windows),
         background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
         ghost_snapshot: GhostSnapshotConfig::default(),
+        copilot_billing: CopilotBillingConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
@@ -4993,6 +4996,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         use_experimental_unified_exec_tool: !cfg!(windows),
         background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
         ghost_snapshot: GhostSnapshotConfig::default(),
+        copilot_billing: CopilotBillingConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
@@ -6213,6 +6217,55 @@ hide_spawn_agent_metadata = false
         Some("profile hint")
     );
     assert!(!config.multi_agent_v2.hide_spawn_agent_metadata);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_billing_config_from_feature_table() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.copilot_billing_headers]
+enabled = true
+chain_tasks = true
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(config.features.enabled(Feature::CopilotBillingHeaders));
+    assert!(config.copilot_billing.chain_tasks);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_copilot_billing_config_overrides_base() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"profile = "no_chain"
+
+[features.copilot_billing_headers]
+chain_tasks = true
+
+[profiles.no_chain.features.copilot_billing_headers]
+chain_tasks = false
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(!config.copilot_billing.chain_tasks);
 
     Ok(())
 }

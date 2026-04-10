@@ -2036,6 +2036,8 @@ impl Session {
                 config.features.enabled(Feature::EnableRequestCompression),
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
+                config.features.enabled(Feature::CopilotBillingHeaders),
+                config.copilot_billing.chain_tasks,
             ),
             code_mode_service: crate::tools::code_mode::CodeModeService::new(
                 config.js_repl_node_path.clone(),
@@ -6228,6 +6230,9 @@ pub(crate) async fn run_turn(
     // one instance across retries within this turn.
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    // Signal whether this turn was user-initiated so Copilot billing headers
+    // mark only the first API call as billable.
+    client_session.begin_turn(!input.is_empty());
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.

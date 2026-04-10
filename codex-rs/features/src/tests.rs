@@ -321,6 +321,55 @@ usage_hint_enabled = false
 }
 
 #[test]
+fn copilot_billing_headers_feature_config_deserializes_table() {
+    let features: FeaturesToml = toml::from_str(
+        r#"
+[copilot_billing_headers]
+enabled = true
+chain_tasks = true
+"#,
+    )
+    .expect("features table should deserialize");
+
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("copilot_billing_headers".to_string(), true)])
+    );
+    assert_eq!(
+        features.copilot_billing_headers,
+        Some(crate::FeatureToml::Config(
+            crate::CopilotBillingHeadersConfigToml {
+                enabled: Some(true),
+                chain_tasks: Some(true),
+            }
+        ))
+    );
+}
+
+#[test]
+fn copilot_billing_headers_chain_tasks_does_not_enable_feature() {
+    let features_toml: FeaturesToml = toml::from_str(
+        r#"
+[copilot_billing_headers]
+chain_tasks = true
+"#,
+    )
+    .expect("features table should deserialize");
+
+    let features = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&features_toml),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+
+    assert_eq!(features.enabled(Feature::CopilotBillingHeaders), false);
+    assert_eq!(features_toml.entries(), BTreeMap::new());
+}
+
+#[test]
 fn unstable_warning_event_only_mentions_enabled_under_development_features() {
     let mut configured_features = Table::new();
     configured_features.insert("child_agents_md".to_string(), TomlValue::Boolean(true));
